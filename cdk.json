@@ -1,0 +1,18 @@
+{
+  "app": "python3 app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "**/__pycache__/**",
+      "tests/**"
+    ]
+  },
+  "context": {
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/aws-route53-patching:fixAliasRecordSetProps": true,
+    "@aws-cdk/core:validationReportJson": true,
+    "aws-cdk:enableDiffNoFail": "true"
+  }
+}

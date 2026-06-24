@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew list *)",
+      "Bash(ls /Applications/ | grep -i docker || echo \"Docker Desktop not installed\")",
+      "Read(//Applications/**)",
+      "Bash(ls -la /Users/jkwak1228/R53/ 2>&1 && ls -la /Users/jkwak1228/ | grep R53)",
+      "Read(//Users/jkwak1228/**)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}
