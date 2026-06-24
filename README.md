@@ -1,268 +1,244 @@
-# Route 53 DNS Infrastructure-as-Code Tool
+# Route 53 DNS Optimizer
 
-A production-grade AWS CDK (Python) application that manages Route 53 hosted zones
-and DNS records programmatically — replicating and improving on the internal DNS
-tooling that platform teams build in practice.
+A full-stack AWS portfolio project that combines Infrastructure-as-Code tooling with a live web application for analyzing and optimizing Route 53 DNS configurations.
 
----
+The project has two layers:
 
-## Why CDK over YAML CloudFormation?
-
-| Concern | YAML CloudFormation | AWS CDK (Python) |
-|---------|---------------------|------------------|
-| Type safety | None — typos fail at deploy | mypy / IDE catches errors locally |
-| Reuse | Copy-paste or nested stacks | Classes, loops, conditionals |
-| Testability | Manual drift-check | `aws_cdk.assertions` unit tests |
-| Code review | Diff is YAML blobs | Diff is Python; intent is clear |
-| Version control | Possible but noisy | First-class; every change is a PR |
+1. **CDK Constructs** — a reusable Python library for managing Route 53 hosted zones, records, failover routing, and IAM policies as code
+2. **Web Application** — a FastAPI + vanilla JS dashboard that connects to your AWS account, scans every hosted zone, and surfaces specific optimization findings with explanations and fix recommendations
 
 ---
 
-## Project structure
+## Live Demo
+
+> Try it without an AWS account using the built-in demo mode, which loads a realistic sample configuration pre-populated with common DNS issues.
+
+---
+
+## What the Analyzer Checks
+
+The analysis engine runs 16 rules across five categories every time you click **Analyze All Zones**.
+
+### Critical
+| Rule | What it catches |
+|------|----------------|
+| `APEX_CNAME` | CNAME at the zone apex — violates RFC 1034 §3.6.2, breaks email delivery |
+| `FAILOVER_NO_HEALTH_CHECK` | Failover PRIMARY record with no health check — Route 53 never actually fails over |
+| `MULTIVALUE_NO_HEALTH_CHECK` | MultiValue Answer record with no health check — unhealthy endpoints still returned |
+
+### Warning
+| Rule | What it catches |
+|------|----------------|
+| `CNAME_TO_AWS_ENDPOINT` | CNAME pointing to an AWS resource (ALB, CloudFront, API Gateway, S3) — should be an alias record |
+| `LATENCY_NO_HEALTH_CHECK` | Latency-based routing with no health check — traffic routed to unhealthy regions |
+| `WEIGHTED_NO_HEALTH_CHECK` | Weighted routing with no health check — traffic proportionally sent to down endpoints |
+| `DUPLICATE_IP` | Same IP address listed multiple times in a record set — no redundancy benefit |
+| `MISSING_CAA` | No CAA records — any certificate authority can issue TLS certs for the domain |
+| `MISSING_SPF` | MX records present but no SPF TXT record — domain is trivially spoofable in email |
+| `MISSING_DMARC` | MX records present but no `_dmarc` record — no enforcement policy for failed auth |
+
+### Info
+| Rule | What it catches |
+|------|----------------|
+| `HIGH_TTL` | TTL > 86400s — DNS changes take over a day to propagate to all clients |
+| `LOW_TTL` | TTL < 60s on non-routing records — inflates Route 53 query costs unnecessarily |
+| `SINGLE_POINT_OF_FAILURE` | Single A record at apex or `www` with no routing policy — one endpoint, no recovery |
+| `LATENCY_SINGLE_REGION` | Latency routing configured but only one region exists — no routing benefit |
+| `WEIGHTED_ZERO` | Weighted record with weight 0 — receives no traffic, dead configuration |
+| `WILDCARD_RECORD` | Wildcard `*` record — any undefined subdomain resolves silently, review for exposure |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Web Application                        │
+│                                                             │
+│   Browser (HTML/CSS/JS)  ◄──────►  FastAPI (Python)        │
+│   - Welcome screen                  - /api/auth            │
+│   - Credential form                 - /api/analysis        │
+│   - Zone sidebar                    - /api/auth/status     │
+│   - Findings dashboard              - /api/zones/{id}/...  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+                    AWS STS + Route 53
+                    (or demo fixture data)
+```
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     CDK Construct Library                   │
+│                                                             │
+│   dns_tool/                                                 │
+│   ├── HostedZoneConstruct   public + private zones          │
+│   ├── AliasRecord           alias-first, apex-safe          │
+│   ├── CnameRecord           zone-apex guard enforced        │
+│   ├── SimpleRecord          MX, TXT, NS, SRV, plain IPs     │
+│   ├── FailoverConstruct     5 routing policies + HC         │
+│   ├── DnsIamPolicies        least-privilege IAM generators  │
+│   └── propagation.py        GetChange polling helper        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Project Structure
 
 ```
 R53/
-├── app.py                          # CDK app entry point
-├── cdk.json                        # CDK configuration
-├── requirements.txt                # Runtime dependencies
-├── requirements-dev.txt            # Test dependencies
-├── dns_tool/
-│   ├── hosted_zone_construct.py    # Public + private hosted zone wrapper
-│   ├── record_constructs.py        # AliasRecord, CnameRecord, SimpleRecord
-│   ├── failover_construct.py       # Multi-Region failover / routing policies
-│   ├── iam_policies.py             # Least-privilege IAM policy generators
-│   ├── propagation.py              # GetChange polling + batch-change helper
-│   └── stack.py                    # Demo stack wiring everything together
-└── tests/
-    ├── test_hosted_zone.py
-    ├── test_record_constructs.py
-    ├── test_failover_construct.py
-    ├── test_iam_policies.py
-    └── test_propagation.py
+├── api/                          # Web application
+│   ├── main.py                   # FastAPI app, routes, session management
+│   ├── r53_client.py             # boto3 wrapper (live + demo mode)
+│   ├── demo_data.py              # Realistic mock Route 53 data
+│   ├── analyzer/
+│   │   ├── engine.py             # Orchestrates all rules per zone
+│   │   ├── models.py             # Pydantic models: Finding, ZoneAnalysis
+│   │   └── rules/
+│   │       ├── alias_rules.py    # CNAME vs alias checks
+│   │       ├── health_check_rules.py
+│   │       ├── ttl_rules.py
+│   │       ├── security_rules.py # CAA, SPF, DMARC, wildcard
+│   │       └── routing_rules.py  # Failover, latency, weighted
+│   └── static/                   # Frontend (HTML, CSS, JS)
+│       ├── index.html
+│       ├── style.css
+│       └── app.js
+├── dns_tool/                     # CDK construct library
+│   ├── hosted_zone_construct.py
+│   ├── record_constructs.py
+│   ├── failover_construct.py
+│   ├── iam_policies.py
+│   ├── propagation.py
+│   └── stack.py                  # Demo CDK stack
+├── tests/                        # 90 unit tests
+│   ├── test_auth.py
+│   ├── test_hosted_zone.py
+│   ├── test_record_constructs.py
+│   ├── test_failover_construct.py
+│   ├── test_iam_policies.py
+│   └── test_propagation.py
+├── app.py                        # CDK app entry point
+├── Dockerfile
+├── Procfile
+└── requirements.txt
 ```
 
 ---
 
-## Design decisions and tradeoffs
+## Running Locally
 
-### 1. Hosted zone construct
+### Prerequisites
+- Python 3.11+
+- AWS credentials configured (optional — demo mode works without them)
 
-`HostedZoneConstruct` wraps both `PublicHostedZone` and `PrivateHostedZone` behind a
-single interface. The caller passes `private_dns_vpc` to switch modes; everything else
-is identical.
-
-**Domain name normalisation** — callers can pass `example.com` or `example.com.`
-interchangeably. The construct strips trailing dots before handing the name to CDK,
-which then adds the canonical trailing dot in the CloudFormation resource. This matches
-the Route 53 console behaviour and prevents duplicate zone creation from FQDN vs.
-bare-name confusion.
-
-**Private zone VPC requirement** — Route 53 private hosted zones require the associated
-VPC to have `enableDnsHostnames` and `enableDnsSupport` set to `true`. CDK sets these
-by default on new VPCs; imported VPCs must have them confirmed manually. The construct
-documents this constraint rather than silently ignoring it.
-
-### 2. Record constructs — alias-first design
-
-Route 53 offers two ways to point a DNS name at an AWS resource:
-
-- **CNAME** — a DNS indirection that requires the resolver to make an additional query.
-  Adds latency, costs per-query, and is **forbidden at the zone apex** (RFC 1034 §3.6.2).
-- **Alias record** — a Route 53 extension that responds with a direct A/AAAA answer.
-  Zero additional queries, no per-query charge for lookups within AWS, and **works at
-  the apex**.
-
-`AliasRecord` is the primary construct for all AWS-resource targets. `CnameRecord`
-exists for non-AWS targets but raises a `ValueError` at synthesis time if the caller
-attempts to place a CNAME at the zone apex, making the error impossible to miss before
-deployment.
-
-**TTL on alias records** — when an alias points to an AWS resource (ALB, CloudFront,
-etc.), Route 53 controls the TTL and the CDK resource deliberately omits the `TTL`
-property. Setting it would cause a CloudFormation error. The unit tests assert its
-absence.
-
-### 3. Multi-Region failover construct
-
-`FailoverConstruct` generates a pair (or set) of `CfnRecordSet` resources rather than
-L2 constructs because the Route 53 L2 layer does not yet expose `SetIdentifier`,
-`Failover`, `Region`, `Weight`, or `MultiValueAnswer`. Using L1 (`Cfn*`) here is
-intentional and documented.
-
-**Supported routing policies:**
-
-| Policy | Use case | Health check required? |
-|--------|----------|------------------------|
-| `FAILOVER` | Active/passive across two regions | Primary only |
-| `LATENCY` | Route to lowest-latency region | Recommended (enforced here) |
-| `WEIGHTED` | Canary / blue-green traffic split | Recommended (enforced here) |
-| `GEOLOCATION` | Serve different content by geography | Recommended (enforced here) |
-| `MULTIVALUE` | Return up to 8 healthy IPs per query | **Required** (enforced here) |
-
-**Health checks** use HTTPS by default (30 s interval, 3-failure threshold). The
-health check FQDN is derived from the ALB DNS name token so CloudFormation resolves
-it at deploy time — no hard-coded values.
-
-**TTL** defaults to 60 seconds for all failover records. A lower TTL means DNS
-clients stop caching a stale answer sooner after a failover event fires. The tradeoff
-is higher query volume; 60 s is the practical lower bound for standard health checks
-(which run every 30 s with a 3-failure threshold, so a failover takes up to 90 s to
-trigger and clients must then flush the cached answer within TTL seconds).
-
-### 4. Change safety and propagation verification
-
-Route 53 change batches are **transactional** — either every record in the batch is
-applied or none are. `batch_changes()` in `propagation.py` enforces this by requiring
-callers to pass all related changes in a single call rather than issuing individual
-`ChangeResourceRecordSets` requests.
-
-`wait_for_insync()` polls `GetChange` until the status transitions from `PENDING` to
-`INSYNC` (typically < 60 s globally). Automated pipelines should call this before
-marking a deployment complete; skipping it risks a pipeline proceeding while DNS is
-still inconsistent.
-
-### 5. Least-privilege IAM
-
-Route 53 condition keys narrow exactly which records a principal can modify:
-
-```
-route53:ChangeResourceRecordSetsNormalizedRecordNames
-```
-
-The "normalized" form lower-cases names and strips trailing dots, making wildcard
-matching reliable across tools that format DNS names differently.
-
-**Allow-suffix policy** (`allow_suffix_policy`)
-
-```json
-"Condition": {
-  "ForAllValues:StringLike": {
-    "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-      "example.com",
-      "*.example.com"
-    ],
-    "route53:ChangeResourceRecordSetsActions": ["CREATE", "UPSERT", "DELETE"],
-    "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA", ...]
-  }
-}
-```
-
-`ForAllValues:StringLike` — the condition must hold for **every** record name in the
-batch. A batch that includes even one out-of-scope name is denied in its entirety.
-This is the safe operator choice; `ForAnyValue` would allow an attacker to mix
-permitted names with protected names in the same batch.
-
-**Protected-suffix policy** (`deny_suffix_policy`)
-
-```json
-"Condition": {
-  "ForAnyValue:StringLike": {
-    "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-      "infra.example.com",
-      "*.infra.example.com"
-    ]
-  }
-}
-```
-
-The DENY uses `ForAnyValue:StringLike` — if **any** name in the batch matches the
-protected suffix, the whole batch is denied. This mirrors the "no-touch infrastructure
-DNS" guardrail that platform teams enforce to prevent application operators from
-accidentally overwriting infrastructure records shared with other systems.
-
-IAM DENY statements cannot be overridden by an Allow in the same or a downstream
-policy, making this a hard guardrail rather than a soft convention.
-
----
-
-## Security notes
-
-- All policies are scoped to a specific hosted zone ARN — not `*`.
-- Write actions require explicit condition key matches; condition-less wildcard writes
-  are not generated by any factory method.
-- Health checks use HTTPS and SNI by default; HTTP-only checks are not offered because
-  they are trivially spoofable.
-- The `ProtectedRecord` / `protected_suffix` concept makes it easy for platform teams
-  to mark DNS records as infrastructure-owned so the tool refuses to modify them.
-- No credentials are stored in code; the tool relies on the executing principal's
-  ambient AWS credentials (instance role, ECS task role, GitHub OIDC, etc.).
-
----
-
-## Getting started
+### Setup
 
 ```bash
-# 1. Create and activate a virtual environment
+# Clone and set up a virtual environment
+git clone https://github.com/jadenkwak/r53-optimizer.git
+cd r53-optimizer
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-# 2. Install dependencies
-pip install -r requirements.txt -r requirements-dev.txt
+### Start the web application
 
-# 3. Run all unit tests
-pytest tests/ -v
+```bash
+python run_api.py
+```
 
-# 4. Synthesize CloudFormation templates (no AWS account needed)
+Open [http://localhost:8000](http://localhost:8000).
+
+**Demo Mode** — click *Try Demo* on the welcome screen. No AWS account needed. Loads a pre-built configuration for a fictional company (`acme-corp.com`) with intentional issues across all severity levels.
+
+**Live Mode** — click *Connect to AWS* and enter your IAM credentials. They are validated immediately via `sts:GetCallerIdentity` and stored only in server memory for the current session. Minimum required permissions:
+```
+route53:ListHostedZones
+route53:ListResourceRecordSets
+```
+
+### Run the CDK constructs
+
+```bash
+# Synthesize CloudFormation templates (no AWS account needed)
 cdk synth
 
-# 5. Deploy to AWS (requires credentials + bootstrapped environment)
+# Deploy (requires credentials and a bootstrapped environment)
 cdk bootstrap aws://ACCOUNT_ID/REGION
 cdk deploy
 ```
 
 ---
 
-## Running the tests
+## Running Tests
 
+```bash
+pytest tests/ -v
 ```
-pytest tests/ -v --tb=short
-```
 
-The test suite uses `aws_cdk.assertions.Template` to assert against synthesized
-CloudFormation JSON — no AWS account or network access required. Tests run in ~2 s.
+90 tests, no AWS account required. Tests run in ~2 seconds.
 
-### What is tested
-
-| Test file | Key assertions |
+| Test file | What it covers |
 |-----------|----------------|
-| `test_hosted_zone.py` | Correct resource count; VPC attached for private zones; no VPC for public zones; trailing-dot normalisation |
-| `test_record_constructs.py` | Alias records use `AliasTarget` not `ResourceRecords`; no TTL on alias records; CNAME at apex raises `ValueError` at synthesis |
-| `test_failover_construct.py` | Failover records have health checks; MultiValue records ALL have health checks; alias used (not CNAME); correct set identifiers, weights, regions |
-| `test_iam_policies.py` | Allow policy scoped to zone ARN; condition key `ChangeResourceRecordSetsNormalizedRecordNames` present; deny policy has explicit `Effect: Deny`; `ForAnyValue:StringLike` on protected suffix |
-| `test_propagation.py` | `wait_for_insync` polls until INSYNC; `TimeoutError` on deadline exceeded; `batch_changes` sends transactional payload; empty list rejected |
+| `test_auth.py` | Full auth flow: valid credentials return token, bad key ID / wrong secret return specific 401 errors, logout clears session, session token used for live analysis |
+| `test_hosted_zone.py` | Public/private zone synthesis, VPC association, trailing-dot normalisation |
+| `test_record_constructs.py` | Alias records use `AliasTarget` not `ResourceRecords`; no TTL on alias records; CNAME at apex raises `ValueError` at synthesis time |
+| `test_failover_construct.py` | Failover records have health checks; MultiValue records ALL have health checks; correct set identifiers, regions, weights |
+| `test_iam_policies.py` | Allow policy scoped to zone ARN; `ForAllValues:StringLike` on `ChangeResourceRecordSetsNormalizedRecordNames`; deny policy has explicit `Effect: Deny` |
+| `test_propagation.py` | `wait_for_insync` polls until INSYNC; `TimeoutError` on deadline; `batch_changes` sends transactional payload |
 
 ---
 
-## Architecture diagram
+## CDK Design Decisions
 
-```
-                   ┌──────────────────────────────────────────┐
-                   │            Route 53 Hosted Zone           │
-                   │              (example.com)                │
-                   │                                           │
-                   │  apex A (alias) ──────────────────────►  │
-                   │  www   A (alias) ──────────────────────►  │──► ALB (us-east-1)
-                   │  api   A (failover PRIMARY + HC) ──────►  │
-                   │  api   A (failover SECONDARY) ─────────►  │──► ALB (us-west-2)
-                   │  mail  A (plain IP)                       │
-                   │  @     MX 10 mail.example.com.            │
-                   │  staging NS → [delegated zone NS records] │
-                   └──────────────────────────────────────────┘
+### Alias records over CNAMEs
 
-  IAM Policies (least-privilege)
-  ┌──────────────────────────────────────┐
-  │ AllowExampleCom (ManagedPolicy)      │
-  │  Allow: ChangeResourceRecordSets     │
-  │  Condition: NormalizedRecordNames    │
-  │    ForAllValues:StringLike           │
-  │    ["example.com", "*.example.com"]  │
-  └──────────────────────────────────────┘
-  ┌──────────────────────────────────────┐
-  │ DenyInfraSuffix (ManagedPolicy)      │
-  │  Deny: ChangeResourceRecordSets      │
-  │  Condition: NormalizedRecordNames    │
-  │    ForAnyValue:StringLike            │
-  │    ["infra.example.com",             │
-  │     "*.infra.example.com"]           │
-  └──────────────────────────────────────┘
-```
+Route 53 alias records resolve directly inside AWS with no extra DNS hop, incur no per-query charge for AWS-resource targets, and work at the zone apex where CNAMEs are forbidden by RFC 1034 §3.6.2. The `AliasRecord` construct enforces this — `CnameRecord` raises a `ValueError` at synthesis time if you attempt to place a CNAME at the apex.
+
+### Failover uses L1 constructs (`CfnRecordSet`)
+
+The CDK L2 layer for Route 53 does not expose `SetIdentifier`, `Failover`, `Region`, `Weight`, or `MultiValueAnswer`. The `FailoverConstruct` drops down to L1 (`CfnRecordSet`) intentionally to access these properties, while still encapsulating all the health check wiring and routing logic behind a clean Python interface.
+
+### Transactional change batches
+
+Route 53 change batches are all-or-none. The `batch_changes()` helper in `propagation.py` enforces this by requiring all related record changes to be submitted in a single `ChangeResourceRecordSets` call. `wait_for_insync()` then polls `GetChange` until the status transitions from `PENDING` to `INSYNC` before allowing an automated pipeline to continue.
+
+### Least-privilege IAM with condition keys
+
+IAM policies use `route53:ChangeResourceRecordSetsNormalizedRecordNames` to scope a principal to specific DNS suffixes:
+
+- **Allow-suffix policy** uses `ForAllValues:StringLike` — the condition must be true for *every* record name in the batch. A single out-of-scope name rejects the entire batch.
+- **Deny-suffix policy** uses `ForAnyValue:StringLike` — if *any* name matches the protected suffix, the entire batch is denied. This is a hard guardrail that no downstream Allow can override.
+
+---
+
+## Deployment
+
+The app is containerized and deployable to any platform that supports Docker.
+
+### Railway (recommended)
+
+1. Push this repo to GitHub
+2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Railway detects the `Dockerfile` automatically
+4. Settings → Networking → Generate Domain for a permanent `https://` URL
+
+### Render
+
+Connect the GitHub repo on [render.com](https://render.com), set Runtime to Docker, and deploy. The `Procfile` is used as a fallback.
+
+### AWS App Runner
+
+For an AWS-native deployment, point App Runner at this repository. It builds the Dockerfile and provides HTTPS + auto-scaling with no server management.
+
+---
+
+## Security
+
+- Credentials entered in the web UI are validated via `sts:GetCallerIdentity` before being accepted
+- Credentials are stored in server memory only for the current session — never written to disk or logged
+- Sessions are identified by a random 32-byte token; closing the browser tab clears it
+- IAM policies generated by the CDK constructs are scoped to specific zone ARNs, not `*`
+- Health checks use HTTPS with SNI enabled by default
